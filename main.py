@@ -1,5 +1,5 @@
 from googleapiclient.discovery import build
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import os
 import argparse
@@ -10,6 +10,10 @@ import sqlite3
 import uuid
 import logging
 from logging.handlers import RotatingFileHandler
+import requests.exceptions
+import tenacity
+from functools import wraps
+import time
 
 # Load environment variables
 load_dotenv()
@@ -60,6 +64,44 @@ DEFAULT_CSV_PATH = f'youtube_data_{datetime.now().strftime("%Y%m%d")}.csv'
 # Create logger
 logger = setup_logging()
 
+# Timeout decorator
+def timeout_handler(timeout_seconds=30):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start_time = time.time()
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    if time.time() - start_time > timeout_seconds:
+                        logger.error(f"Function {func.__name__} timed out after {timeout_seconds} seconds")
+                        raise TimeoutError(f"Operation timed out: {str(e)}")
+                    time.sleep(1)  # Wait before retrying
+                except Exception as e:
+                    logger.error(f"Error in {func.__name__}: {str(e)}", exc_info=True)
+                    raise
+        return wrapper
+    return decorator
+
+# Retry decorator for API calls
+def api_retry(max_attempts=3, wait_seconds=2):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_attempts - 1:
+                        logger.error(f"Failed after {max_attempts} attempts: {str(e)}", exc_info=True)
+                        raise
+                    logger.warning(f"Attempt {attempt + 1} failed, retrying in {wait_seconds} seconds...")
+                    time.sleep(wait_seconds)
+            return None
+        return wrapper
+    return decorator
+
 def create_database(db_path):
     """Create SQLite database and necessary tables"""
     logger.info(f"Creating/connecting to database at {db_path}")
@@ -104,9 +146,12 @@ def parse_arguments():
                       help='OpenAI API key for generating summaries')
     return parser.parse_args()
 
+@timeout_handler(timeout_seconds=60)
+@api_retry(max_attempts=3)
 def get_video_transcript(video_id):
     """
     Fetch transcript for a YouTube video in both Korean and English.
+    Added timeout and retry handling.
     
     Args:
         video_id (str): YouTube video ID
@@ -142,6 +187,8 @@ def get_video_transcript(video_id):
         logger.error(f"Error fetching transcript for {video_id}: {str(e)}", exc_info=True)
         return None, None
 
+@timeout_handler(timeout_seconds=120)
+@api_retry(max_attempts=3)
 def get_playlist_videos(youtube, playlist_id):
     videos = []
     
@@ -249,6 +296,8 @@ def chunk_text(text, target_token_size=1000):
     
     return chunks
 
+@timeout_handler(timeout_seconds=180)
+@api_retry(max_attempts=3)
 def generate_bullet_summary(transcript_text, target_language="ko"):
     """
     Generate a bullet-point formatted summary of transcript text using OpenAI's API.
@@ -353,90 +402,125 @@ Summaries to combine:
         logger.error(f"Error in summary generation: {str(e)}", exc_info=True)
         return None
 
+def update_csv_from_db(db_path, csv_path):
+    """Update CSV file with latest database content"""
+    try:
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query('''
+            SELECT * FROM videos 
+            ORDER BY published_at DESC
+        ''', conn)
+        df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        conn.close()
+        logger.info(f"CSV file updated successfully: {csv_path}")
+    except Exception as e:
+        logger.error(f"Error updating CSV file: {str(e)}", exc_info=True)
+
+def get_existing_video_ids(cursor):
+    """Get list of video IDs already in database"""
+    cursor.execute('SELECT video_id FROM videos')
+    return {row[0] for row in cursor.fetchall()}
+
 def main():
     # Parse command line arguments
     args = parse_arguments()
     
     logger.info("Starting YouTube transcript extraction and summarization")
     
-    # Create YouTube API client
-    youtube = build('youtube', 'v3', developerKey=args.youtube_api_key)
-    
-    # Set OpenAI API key
-    if args.openai_api_key:
-        openai.api_key = args.openai_api_key
-        logger.debug("OpenAI API key set successfully")
-    
-    # Create database connection
-    conn = create_database(args.db_path)
-    cursor = conn.cursor()
-    
-    # Get videos from playlist
-    logger.info(f"Fetching videos from playlist: {args.playlist_id}")
-    videos = get_playlist_videos(youtube, args.playlist_id)
-    total_videos = len(videos)
-    logger.info(f"Found {total_videos} videos in playlist")
-    
-    # Process each video
-    for idx, video in enumerate(videos, 1):
-        logger.info(f"Processing video [{idx}/{total_videos}]: {video['title']}")
-        
-        # Get transcripts
-        ko_transcript, en_transcript = get_video_transcript(video['video_id'])
-        
-        # Generate summaries if transcripts are available
-        ko_summary = None
-        en_summary = None
-        
-        if ko_transcript:
-            logger.info(f"[{idx}/{total_videos}] Generating Korean summary...")
-            ko_summary = generate_bullet_summary(ko_transcript, "ko")
-        
-        if en_transcript:
-            logger.info(f"[{idx}/{total_videos}] Generating English summary...")
-            en_summary = generate_bullet_summary(en_transcript, "en")
-        
-        # Store in database
-        try:
-            cursor.execute('''
-                INSERT OR REPLACE INTO videos 
-                (uuid, video_id, video_url, title, description, published_at, 
-                 transcript_ko, transcript_en, summary_ko, summary_en)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                video['uuid'],
-                video['video_id'],
-                video['video_url'],
-                video['title'],
-                video['description'],
-                video['published_at'],
-                ko_transcript,
-                en_transcript,
-                ko_summary,
-                en_summary
-            ))
-            conn.commit()
-            logger.debug(f"[{idx}/{total_videos}] Successfully saved data for video {video['video_id']}")
-        except Exception as e:
-            logger.error(f"[{idx}/{total_videos}] Error saving video data to database: {str(e)}", exc_info=True)
-    
-    # Create DataFrame from database for CSV export
     try:
-        df = pd.read_sql_query('''
-            SELECT * FROM videos 
-            ORDER BY published_at DESC
-        ''', conn)
+        # Create YouTube API client
+        youtube = build('youtube', 'v3', developerKey=args.youtube_api_key)
         
-        # Save to CSV
-        df.to_csv(args.output_csv, index=False, encoding='utf-8-sig')
-        logger.info(f"Data saved to database: {args.db_path}")
-        logger.info(f"Data exported to CSV: {args.output_csv}")
+        # Set OpenAI API key
+        if args.openai_api_key:
+            openai.api_key = args.openai_api_key
+            logger.debug("OpenAI API key set successfully")
+        
+        # Create database connection
+        conn = create_database(args.db_path)
+        cursor = conn.cursor()
+        
+        # Get existing video IDs
+        existing_video_ids = get_existing_video_ids(cursor)
+        
+        # Get videos from playlist
+        logger.info(f"Fetching videos from playlist: {args.playlist_id}")
+        all_videos = get_playlist_videos(youtube, args.playlist_id)
+        
+        # Filter out videos already in database
+        new_videos = [video for video in all_videos if video['video_id'] not in existing_video_ids]
+        total_videos = len(new_videos)
+        
+        logger.info(f"Found {len(all_videos)} videos in playlist, {total_videos} are new")
+        
+        db_updated = False
+        
+        # Process each new video
+        for idx, video in enumerate(new_videos, 1):
+            try:
+                logger.info(f"Processing new video [{idx}/{total_videos}]: {video['title']}")
+                
+                # Get transcripts with timeout and retry handling
+                ko_transcript, en_transcript = get_video_transcript(video['video_id'])
+                
+                # Generate summaries if transcripts are available
+                ko_summary = None
+                en_summary = None
+                
+                if ko_transcript:
+                    logger.info(f"[{idx}/{total_videos}] Generating Korean summary...")
+                    ko_summary = generate_bullet_summary(ko_transcript, "ko")
+                
+                if en_transcript:
+                    logger.info(f"[{idx}/{total_videos}] Generating English summary...")
+                    en_summary = generate_bullet_summary(en_transcript, "en")
+                
+                # Store in database
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO videos 
+                        (uuid, video_id, video_url, title, description, published_at, 
+                         transcript_ko, transcript_en, summary_ko, summary_en)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        video['uuid'],
+                        video['video_id'],
+                        video['video_url'],
+                        video['title'],
+                        video['description'],
+                        video['published_at'],
+                        ko_transcript,
+                        en_transcript,
+                        ko_summary,
+                        en_summary
+                    ))
+                    conn.commit()
+                    db_updated = True
+                    logger.debug(f"[{idx}/{total_videos}] Successfully saved data for video {video['video_id']}")
+                except Exception as e:
+                    logger.error(f"[{idx}/{total_videos}] Error saving video data to database: {str(e)}", exc_info=True)
+                    continue
+                
+                # Update CSV file after each successful database update
+                if db_updated:
+                    update_csv_from_db(args.db_path, args.output_csv)
+                    db_updated = False
+                
+            except Exception as e:
+                logger.error(f"Error processing video {video['video_id']}: {str(e)}", exc_info=True)
+                continue
+        
+        # Final CSV update in case any changes weren't captured
+        if db_updated:
+            update_csv_from_db(args.db_path, args.output_csv)
+        
+        # Close database connection
+        conn.close()
+        logger.info(f"Processing completed. Processed {total_videos} new videos in total.")
+        
     except Exception as e:
-        logger.error(f"Error exporting data to CSV: {str(e)}", exc_info=True)
-    
-    # Close database connection
-    conn.close()
-    logger.info(f"Processing completed. Processed {total_videos} videos in total.")
+        logger.error(f"Fatal error in main execution: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()
